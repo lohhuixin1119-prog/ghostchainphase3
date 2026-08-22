@@ -46,18 +46,24 @@ class GraphState:
         self.reset()
 
     def reset(self):
-        self.tx_store: Dict[str, dict] = {}          # txId -> full tx dict
-        self.adj: Dict[str, Set[str]] = defaultdict(set)     # from -> set of to
-        self.reverse_adj: Dict[str, Set[str]] = defaultdict(set) # to -> set of from
-        self.timestamps: Dict[str, datetime] = {}    # txId -> datetime
-        self.from_to_latest: Dict[Tuple[str, str], str] = {}  # (from, to) -> latest txId
-        self.identity_store: Dict[str, Dict] = {}    # txId -> {ip, device}
-        self.score_cache: Dict[str, float] = {}      # txId -> riskScore
+        self.tx_store: Dict[str, dict] = {}
+        self.adj: Dict[str, Set[str]] = defaultdict(set)
+        self.reverse_adj: Dict[str, Set[str]] = defaultdict(set)
+        self.timestamps: Dict[str, datetime] = {}
+        self.from_to_latest: Dict[Tuple[str, str], str] = {}
+        self.identity_store: Dict[str, Dict] = {}
+        self.score_cache: Dict[str, float] = {}
+        self.current_time: Optional[datetime] = None  # track latest timestamp seen
 
     def add_transaction(self, tx: TransactionRequest, score: float):
         tx_id = tx.txId
         self.tx_store[tx_id] = tx.dict()
-        self.timestamps[tx_id] = datetime.fromisoformat(tx.createdAt.replace('Z', '+00:00'))
+        dt = datetime.fromisoformat(tx.createdAt.replace('Z', '+00:00'))
+        self.timestamps[tx_id] = dt
+        # Update current_time
+        if self.current_time is None or dt > self.current_time:
+            self.current_time = dt
+
         self.adj[tx.fromUserId].add(tx.toUserId)
         self.reverse_adj[tx.toUserId].add(tx.fromUserId)
         self.from_to_latest[(tx.fromUserId, tx.toUserId)] = tx_id
@@ -71,9 +77,11 @@ class GraphState:
     def get_score(self, tx_id: str) -> Optional[float]:
         return self.score_cache.get(tx_id)
 
-    def cleanup_old(self, reference_time: datetime):
-        """Remove transactions older than (reference_time - 24h)."""
-        cutoff = reference_time - timedelta(hours=24)
+    def cleanup_old(self):
+        """Remove transactions older than current_time - 24h."""
+        if self.current_time is None:
+            return
+        cutoff = self.current_time - timedelta(hours=24)
         to_remove = [tid for tid, ts in self.timestamps.items() if ts < cutoff]
         for tid in to_remove:
             tx_data = self.tx_store.get(tid)
@@ -105,12 +113,12 @@ class GraphState:
 # ---------- Global State ----------
 state = GraphState()
 
-# ---------- Helper: Find longest path ending at a node ----------
+# ---------- Helper: Find all paths ending at a node ----------
 
-def find_longest_paths_to_node(node: str, max_depth: int = 6) -> List[List[str]]:
+def find_all_paths_to_node(node: str, max_depth: int = 6) -> List[List[str]]:
     """
-    Find all simple paths from any source to 'node' (reverse traversal).
-    Returns paths sorted by length (longest first).
+    Find all simple paths that end at 'node' (reverse BFS).
+    Returns paths from source to node (inclusive of both ends).
     """
     paths = []
     queue = deque([(node, [node])])
@@ -124,24 +132,16 @@ def find_longest_paths_to_node(node: str, max_depth: int = 6) -> List[List[str]]
             new_path = [pred] + path
             paths.append(new_path)
             queue.append((pred, new_path))
-    # Sort by length descending (longest first)
+    # Sort by length descending (longer paths first)
     paths.sort(key=len, reverse=True)
     return paths
-
-def get_longest_path(node: str) -> List[str]:
-    """Return the longest path ending at 'node' (including node)."""
-    all_paths = find_longest_paths_to_node(node)
-    if not all_paths:
-        return [node]  # just itself
-    # Return the longest one (first)
-    return all_paths[0]
 
 # ---------- Scoring Functions ----------
 
 def structural_signals(tx: TransactionRequest) -> float:
-    """Global structural signals (cycles, length, convergence/divergence)."""
+    """Global structural risk (cycles, branching, path length)."""
     score = 0.0
-    # Cycle detection: BFS from toUserId to fromUserId
+    # Cycle detection (graph already contains prior edges)
     visited = set()
     queue = deque([tx.toUserId])
     found_cycle = False
@@ -159,31 +159,30 @@ def structural_signals(tx: TransactionRequest) -> float:
     if found_cycle:
         score += 0.3
 
-    # Path length: longest chain ending at fromUserId
-    path = get_longest_path(tx.fromUserId)
-    if len(path) >= 4:
-        score += 0.1 * (len(path) - 3)
+    # Path length – longest chain ending at fromUserId
+    paths = find_all_paths_to_node(tx.fromUserId)
+    max_len = max((len(p) for p in paths), default=1)
+    if max_len >= 4:
+        score += 0.1 * (max_len - 3)
 
-    # Convergence: many incoming to toUserId
+    # Convergence (multiple incoming to toUserId)
     if len(state.reverse_adj.get(tx.toUserId, set())) > 1:
         score += 0.15
-    # Divergence: many outgoing from fromUserId
+    # Divergence (multiple outgoing from fromUserId)
     if len(state.adj.get(tx.fromUserId, set())) > 1:
         score += 0.1
 
     return min(score, 0.6)
 
-def identity_signals(tx: TransactionRequest, path: List[str]) -> float:
+def path_identity_score(path: List[str]) -> float:
     """
-    Evaluate identity changes along the given path.
-    path includes all nodes from source to tx.fromUserId.
-    We check IP/device changes between consecutive edges.
-    Also check for disappearance (present earlier, absent later).
+    Evaluate identity changes along a single path.
+    path includes nodes from source to the end (fromUserId of new tx).
+    We compare IP/device between consecutive edges.
     """
     if len(path) < 2:
         return 0.0
     score = 0.0
-    # For each edge in the path, get the transaction ID
     for i in range(len(path)-1):
         f = path[i]
         t = path[i+1]
@@ -193,7 +192,6 @@ def identity_signals(tx: TransactionRequest, path: List[str]) -> float:
         tx_data = state.tx_store.get(edge_tx_id)
         if not tx_data:
             continue
-        # Compare identity with previous edge (if any)
         if i > 0:
             prev_f = path[i-1]
             prev_t = path[i]
@@ -201,30 +199,30 @@ def identity_signals(tx: TransactionRequest, path: List[str]) -> float:
             if prev_edge_id:
                 prev_data = state.tx_store.get(prev_edge_id)
                 if prev_data:
-                    # IP change
-                    if tx_data.get('ipAddress') and prev_data.get('ipAddress'):
-                        if tx_data['ipAddress'] != prev_data['ipAddress']:
-                            score += 0.15
-                    # IP disappearance: present earlier, absent now
-                    elif prev_data.get('ipAddress') and not tx_data.get('ipAddress'):
-                        score += 0.2
-                    # Device change
-                    if tx_data.get('deviceId') and prev_data.get('deviceId'):
-                        if tx_data['deviceId'] != prev_data['deviceId']:
-                            score += 0.15
-                    elif prev_data.get('deviceId') and not tx_data.get('deviceId'):
+                    # IP change / disappearance
+                    prev_ip = prev_data.get('ipAddress')
+                    curr_ip = tx_data.get('ipAddress')
+                    if prev_ip and curr_ip and prev_ip != curr_ip:
+                        score += 0.15
+                    elif prev_ip and not curr_ip:
+                        score += 0.2  # disappearance
+                    # Device change / disappearance
+                    prev_dev = prev_data.get('deviceId')
+                    curr_dev = tx_data.get('deviceId')
+                    if prev_dev and curr_dev and prev_dev != curr_dev:
+                        score += 0.15
+                    elif prev_dev and not curr_dev:
                         score += 0.2
     return min(score, 0.5)
 
-def value_signals(tx: TransactionRequest, path: List[str]) -> float:
+def path_value_score(path: List[str], new_amount: float) -> float:
     """
-    Evaluate amount progression along the path.
-    path includes all nodes from source to tx.fromUserId.
-    We append the new transaction amount as the last step.
+    Evaluate amount progression along a path.
+    path includes nodes up to fromUserId (excludes the new edge).
+    We append new_amount as the final step.
     """
     if len(path) < 2:
         return 0.0
-    # Get amounts along the edges of the path
     amounts = []
     for i in range(len(path)-1):
         f = path[i]
@@ -236,8 +234,7 @@ def value_signals(tx: TransactionRequest, path: List[str]) -> float:
         if not tx_data:
             return 0.0
         amounts.append(tx_data['amount'])
-    # Append the new transaction amount
-    amounts.append(tx.amount)
+    amounts.append(new_amount)
 
     # Compute ratios (step i+1 / step i)
     ratios = []
@@ -245,35 +242,53 @@ def value_signals(tx: TransactionRequest, path: List[str]) -> float:
         if amounts[i] == 0:
             continue
         ratios.append(amounts[i+1] / amounts[i])
-
     if not ratios:
         return 0.0
 
-    # Check for reversal (any ratio > 1.0)
+    # Reversal: any ratio > 1.0 -> high risk
     if any(r > 1.0 for r in ratios):
-        return 0.4  # high penalty for reversal
+        return 0.4
 
-    # Check for consistent decay (all ratios < 1 and close to 0.99)
-    # Calculate mean and variance
+    # Otherwise, check consistency (variance)
     mean = sum(ratios) / len(ratios)
     variance = sum((r - mean)**2 for r in ratios) / len(ratios) if len(ratios) > 1 else 0.0
-    # If all ratios < 1, this is typical layering. Low risk.
     if all(r < 1.0 for r in ratios):
-        # But if variance is high, it might be less consistent -> medium risk
         if variance > 0.01:
             return 0.15
         else:
-            return 0.05  # very low
+            return 0.05  # normal layering
     else:
-        # Mixed – some below, some above? Actually we already handled >1.
-        # If some ratios exactly 1.0? Rare.
-        return 0.2
+        return 0.2  # mixed
+
+def evaluate_paths(tx: TransactionRequest) -> Tuple[float, float]:
+    """
+    For all paths ending at tx.fromUserId, compute identity and value scores.
+    Return the maximum identity score and maximum value score across paths.
+    """
+    paths = find_all_paths_to_node(tx.fromUserId)
+    if not paths:
+        # No incoming path; only the new edge exists
+        # Identity: none (only new tx, no prior to compare)
+        # Value: no previous amount, so no signal
+        return 0.0, 0.0
+
+    max_id_score = 0.0
+    max_val_score = 0.0
+    for path in paths:
+        # Identity on this path
+        id_s = path_identity_score(path)
+        # Value on this path (path includes nodes up to fromUserId)
+        val_s = path_value_score(path, tx.amount)
+        if id_s > max_id_score:
+            max_id_score = id_s
+        if val_s > max_val_score:
+            max_val_score = val_s
+
+    return max_id_score, max_val_score
 
 def combine_scores(structural, identity, value) -> float:
-    """Weighted combination to produce final risk score."""
-    # Weights: structural 0.3, identity 0.3, value 0.4
+    """Final risk score combination."""
     raw = structural * 0.3 + identity * 0.3 + value * 0.4
-    # Cap at 1.0
     return min(raw, 1.0)
 
 # ---------- Endpoints ----------
@@ -291,32 +306,27 @@ async def reset(clear: dict = None):
 async def process_transactions(req: TransactionsRequest):
     results = []
     for tx in req.transactions:
-        # Check idempotency
+        # Idempotency check
         cached = state.get_score(tx.txId)
         if cached is not None:
             results.append(TransactionResult(txId=tx.txId, riskScore=cached))
             continue
 
-        # 1. Cleanup old transactions based on this tx's createdAt
-        tx_time = datetime.fromisoformat(tx.createdAt.replace('Z', '+00:00'))
-        state.cleanup_old(tx_time)
+        # 1. Cleanup based on current_time (latest seen timestamp)
+        state.cleanup_old()
 
-        # 2. Find the longest path ending at tx.fromUserId
-        path = get_longest_path(tx.fromUserId)
-        # The path includes tx.fromUserId at the end; we'll use it for identity and value
-
-        # 3. Compute signals
+        # 2. Compute structural signal (global)
         struct_score = structural_signals(tx)
-        id_score = identity_signals(tx, path)
-        value_score = value_signals(tx, path)
+
+        # 3. Evaluate all paths for identity and value signals
+        id_score, val_score = evaluate_paths(tx)
 
         # 4. Combine
-        final_score = combine_scores(struct_score, id_score, value_score)
+        final_score = combine_scores(struct_score, id_score, val_score)
 
-        # 5. Add transaction to state
+        # 5. Add transaction to state (this updates current_time)
         state.add_transaction(tx, final_score)
 
-        # 6. Append result
         results.append(TransactionResult(txId=tx.txId, riskScore=final_score))
 
     return TransactionsResponse(transactions=results)
