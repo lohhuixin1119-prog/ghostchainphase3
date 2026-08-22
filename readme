@@ -1,0 +1,101 @@
+markdown
+# Ghost Chains – AML Risk Scoring Service (Phase 3)
+
+## Features
+- Full compliance with Phase 1, 2, and 3 requirements
+- Stateful graph with 24‑hour lookback window
+- Idempotent transaction processing
+- Risk scores combining structural, identity, and value signals
+- Clean API endpoints: `/health`, `/reset`, `/transactions`
+
+## Setup
+
+```bash
+pip install -r requirements.txt
+Run locally
+bash
+uvicorn main:app --reload --port 8080
+Test with cURL
+bash
+# Health
+curl http://localhost:8080/ghost-chains/health
+
+# Reset
+curl -X POST http://localhost:8080/ghost-chains/reset -H "Content-Type: application/json" -d '{"clearTransactions":true}'
+
+# Send a transaction
+curl -X POST http://localhost:8080/ghost-chains/transactions -H "Content-Type: application/json" -d '{
+  "transactions": [
+    {
+      "txId": "tx1",
+      "fromUserId": "meridian",
+      "toUserId": "apex",
+      "amount": 10000,
+      "createdAt": "2026-06-08T12:00:00Z"
+    }
+  ]
+}'
+Deploy to Render
+Create a new Web Service.
+
+Build command: pip install -r requirements.txt
+
+Start command: uvicorn main:app --host 0.0.0.0 --port $PORT
+
+Scoring Logic (summary)
+Structural: cycles (+0.3), long paths (+0.1 per extra step), convergence/divergence (+0.15 each)
+
+Identity: IP/device changes on same edge (+0.15 each)
+
+Value: amount reversal (+0.3), high variance (+0.1)
+
+Combined with weights: structural 0.5, identity 0.2, value 0.3, capped at 1.0
+
+This gives a coherent model that ranks suspicious patterns higher.
+
+text
+
+---
+
+### 4. (Optional) `test_phase3.py` – basic smoke test
+
+```python
+import requests
+import json
+
+BASE = "http://localhost:8080"
+
+def test_health():
+    r = requests.get(f"{BASE}/ghost-chains/health")
+    assert r.status_code == 200
+    assert r.json() == {"status": "ok"}
+
+def test_reset():
+    r = requests.post(f"{BASE}/ghost-chains/reset", json={"clearTransactions": True})
+    assert r.status_code == 200
+    assert r.json() == {"clearTransactions": True}
+
+def test_transactions():
+    payload = {
+        "transactions": [
+            {
+                "txId": "tx1",
+                "fromUserId": "meridian",
+                "toUserId": "apex",
+                "amount": 10000,
+                "createdAt": "2026-06-08T12:00:00Z"
+            }
+        ]
+    }
+    r = requests.post(f"{BASE}/ghost-chains/transactions", json=payload)
+    assert r.status_code == 200
+    data = r.json()
+    assert len(data["transactions"]) == 1
+    assert data["transactions"][0]["txId"] == "tx1"
+    assert 0.0 <= data["transactions"][0]["riskScore"] <= 1.0
+
+if __name__ == "__main__":
+    test_health()
+    test_reset()
+    test_transactions()
+    print("All tests passed.")
